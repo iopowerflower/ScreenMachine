@@ -2,6 +2,12 @@
 
 A Python application that processes video files, extracts screenshots at evenly spaced intervals, and assembles them into grid images with optional metadata labels.
 
+ScreenMachine functions similarly to AMT Auto Movie Thumbnailer, but is 30x as fast for generating screenshots. This is the result of advanced seeking optimizations allowed by FFmpeg.
+
+ScreenMachine functions optimally over the network, with spinning hard drives, and with NVME/SSD, seeking frames dynamically to reduce read strain and CPU consumption as much as possible.
+
+Adjust the number of worker threads for your use case.
+
 ## Features
 
 - Recursively processes all videos in a selected directory and subdirectories
