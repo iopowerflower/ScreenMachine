@@ -8,6 +8,8 @@ ScreenMachine functions optimally over the network, with spinning hard drives, a
 
 Adjust the number of worker threads for your use case.
 
+![sm](https://github.com/user-attachments/assets/6368a7d4-5fbd-4c6b-abf6-1d9297d7f30c)
+
 ## Features
 
 - Recursively processes all videos in a selected directory and subdirectories
