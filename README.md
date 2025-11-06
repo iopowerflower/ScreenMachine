@@ -34,17 +34,19 @@ Adjust the number of worker threads for your use case.
 ## Requirements
 
 - Python 3.8 or higher
-- See `requirements.txt` for dependencies
+- FFmpeg (installed on system or will be auto-downloaded on Windows)
+- See `requirements.txt` for Python dependencies
 
 ## Installation
 
 1. Clone or download this repository
-2. Install system dependencies:
+2. Install dependencies:
 
    **Windows:**
    ```bash
    pip install -r requirements.txt
    ```
+   FFmpeg will be auto-downloaded on first run if not found in PATH.
 
    **Linux:**
    ```bash
@@ -93,33 +95,21 @@ To create a standalone executable (no Python installation required):
 ```bash
 # Recommended: Use the provided build script (handles everything automatically)
 python build_executable.py
-
-# Or manually with pyinstaller (includes FFmpeg if found in PATH):
-# Note: Replace C:\ffmpeg\bin\ffmpeg.EXE and C:\ffmpeg\bin\ffprobe.EXE with your FFmpeg paths
-pyinstaller --onefile --windowed --icon=icon.ico --add-data="icon.ico;." \
-  --add-binary="C:\ffmpeg\bin\ffmpeg.EXE;ffmpeg" --add-binary="C:\ffmpeg\bin\ffprobe.EXE;ffprobe" \
-  --name "ScreenMachine" main.py \
-  --collect-all customtkinter --collect-all av --hidden-import av --hidden-import PIL._tkinter_finder
 ```
+
+**Note:** FFmpeg is not bundled with the executable. The app will automatically download FFmpeg on first run if not found in system PATH (Windows only).
 
 #### Linux
 
 ```bash
 # Recommended: Use the provided build script (handles everything automatically)
 python3 build_executable.py
-
-# Or manually with pyinstaller (includes FFmpeg if found in PATH):
-# Note: Replace /usr/bin/ffmpeg and /usr/bin/ffprobe with your FFmpeg paths (use `which ffmpeg` to find them)
-pyinstaller --onefile --noconsole --icon=icon.png --add-data="icon.png:." \
-  --add-binary="$(which ffmpeg):ffmpeg" --add-binary="$(which ffprobe):ffprobe" \
-  --name "ScreenMachine" main.py \
-  --collect-all customtkinter --collect-all av --hidden-import av --hidden-import PIL._tkinter_finder
-
-# Note: On Linux, you may need to install additional dependencies:
-# sudo apt-get install python3-tk python3-dev
 ```
 
-**Note:** The build script automatically creates `ScreenMachine.spec` with all dependencies, including FFmpeg binaries. If you run pyinstaller manually, you must include `--add-binary` flags for FFmpeg, or the executable will be smaller but won't work without FFmpeg installed on the target system. For Linux, the script will look for `icon.png` first, then fall back to `icon.ico` if available.
+**Note:** FFmpeg must be installed on the target system. On Linux, you may need to install additional dependencies:
+```bash
+sudo apt-get install python3-tk python3-dev
+```
 
 The executable will be created in the `dist` folder and can be distributed without requiring Python.
 
@@ -174,33 +164,38 @@ The application uses a configurable logging system with four log levels:
 - **WARNING**: Warnings that don't stop processing (partial frame extraction, corrupt videos)
 - **ERROR**: Serious errors that prevent processing (failed file opens, no video streams)
 
-### Setting Log Level
-
-The log level can be set via the `LOG_LEVEL` environment variable:
+### Command-Line Flags
 
 ```bash
-# Windows (Command Prompt)
-set LOG_LEVEL=WARNING
-python main.py
+# Set log level
+python main.py --log DEBUG
+python main.py --log INFO
+python main.py --log WARNING
+python main.py --log ERROR
+python main.py --log NONE
 
-# Windows (PowerShell)
-$env:LOG_LEVEL="WARNING"
-python main.py
+# Shortcuts
+python main.py --verbose    # Equivalent to --log INFO
+python main.py --debug       # Equivalent to --log DEBUG
 
-# Linux/Mac
-export LOG_LEVEL=WARNING
-python main.py
+# Specify log file
+python main.py --log-file path/to/logfile.log
+
+# Combine flags
+python main.py --verbose --log-file screenmachine.log
 ```
 
-**Default log level**: `WARNING` (only warnings and errors are shown)
+**Default**: No logging (logging is disabled unless explicitly enabled via flags)
 
 ### Log Level Examples
 
 - `DEBUG`: Show all messages including detailed frame extraction info
 - `INFO`: Show informational messages and above (including fallback messages)
-- `WARNING`: Show warnings and errors only (default, recommended for normal use)
+- `WARNING`: Show warnings and errors only (recommended for normal use)
 - `ERROR`: Show only serious errors
 - `NONE`: Disable all logging
+
+**Note**: Logging is only enabled when you use `--log`, `--verbose`, `--debug`, or `--log-file` flags. No log file is created automatically.
 
 ## Notes
 

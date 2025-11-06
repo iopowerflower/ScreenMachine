@@ -244,18 +244,28 @@ def create_grid(images: List[Tuple[Image.Image, float]],
         padding = 10
         
         if config.show_title:
-            label_lines.append(f"Title: {metadata['filename']}")
+            filename = metadata.get('filename', 'Unknown')
+            label_lines.append(f"Title: {filename}")
         if config.show_resolution:
-            width, height = metadata['resolution']
-            label_lines.append(f"Resolution: {width} × {height}")
+            resolution = metadata.get('resolution')
+            if resolution and isinstance(resolution, (tuple, list)) and len(resolution) >= 2:
+                width, height = resolution[0], resolution[1]
+                label_lines.append(f"Resolution: {width} × {height}")
+            elif 'width' in metadata and 'height' in metadata:
+                label_lines.append(f"Resolution: {metadata['width']} × {metadata['height']}")
         if config.show_file_size:
-            size_str = format_file_size(metadata['file_size'])
-            label_lines.append(f"File Size: {size_str}")
+            file_size = metadata.get('file_size', 0)
+            if file_size > 0:
+                size_str = format_file_size(file_size)
+                label_lines.append(f"File Size: {size_str}")
         if config.show_duration:
-            duration_str = format_duration(metadata['duration'])
-            label_lines.append(f"Duration: {duration_str}")
+            duration = metadata.get('duration', 0.0)
+            if duration > 0:
+                duration_str = format_duration(duration)
+                label_lines.append(f"Duration: {duration_str}")
         if config.show_codec:
-            label_lines.append(f"Codec: {metadata['codec']}")
+            codec = metadata.get('codec', 'Unknown')
+            label_lines.append(f"Codec: {codec}")
         
         header_height = len(label_lines) * line_height + (padding * 2)
     

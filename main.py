@@ -3,19 +3,25 @@ Main GUI application for Screen Machine.
 """
 import os
 import sys
+import argparse
 import threading
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import customtkinter as ctk
 import time
+import traceback
 
 from config import ProcessingConfig, get_default_output_dir, ensure_output_dir
 from video_processor import find_video_files, extract_screenshots, get_video_metadata
 from image_composer import create_grid, save_grid_image
 from utils import calculate_output_path
 from PIL import Image, ImageTk
+from logger import (
+    LogLevel, set_log_level, set_log_file, critical_error, close_log_file, 
+    warning, get_log_level, info, error
+)
 
 
 # Configure customtkinter appearance
@@ -27,51 +33,94 @@ class ScreenMachineApp(ctk.CTk):
     """Main application window."""
     
     def __init__(self):
-        super().__init__()
-        
-        self.title("Screen Machine")
-        self.geometry("900x820+0+0")  # Position at top-left corner
-        self.resizable(True, True)
-        
-        # Processing state
-        self.is_processing = False
-        self.processing_thread: Optional[threading.Thread] = None
-        self.current_config: Optional[ProcessingConfig] = None
-        self.processing_start_time: Optional[float] = None
-        
-        # Variables
-        self.input_dir = tk.StringVar(value="")
-        self.output_dir = tk.StringVar(value="")
-        self.suffix_var = tk.StringVar(value="")
-        
-        # Performance defaults
-        self.workers_var = tk.StringVar(value="2")
-        
-        # Preview state
-        self.current_preview_image = None
-        self.preview_photo = None
-        
-        # Canvas references for initialization
-        self.left_canvas = None
-        self.left_window = None
-        self.right_canvas = None
-        self.right_window = None
-        
-        self.setup_ui()
-        # Set window icon after UI is initialized (needs to be done after window is created)
-        self.after(100, self._set_window_icon)
-        # Initialize canvas sizes after window is displayed
-        self.after(100, self.initialize_canvas_sizes)
+        try:
+            info("Initializing ScreenMachineApp", prefix="INIT")
+            
+            super().__init__()
+            info("Base class initialized", prefix="INIT")
+            
+            self.title("Screen Machine")
+            self.geometry("900x680+0+0")  # Position at top-left corner (reduced height due to padding reduction)
+            self.resizable(True, True)
+            info("Window properties set", prefix="INIT")
+            
+            # Processing state
+            self.is_processing = False
+            self.processing_thread: Optional[threading.Thread] = None
+            self.current_config: Optional[ProcessingConfig] = None
+            self.processing_start_time: Optional[float] = None
+            
+            # Variables
+            self.input_dir = tk.StringVar(value="")
+            self.output_dir = tk.StringVar(value="")
+            self.suffix_var = tk.StringVar(value="")
+            
+            # Performance defaults
+            self.workers_var = tk.StringVar(value="2")
+            
+            # Preview state
+            self.current_preview_image = None
+            self.preview_photo = None
+            
+            # Canvas references for initialization
+            self.left_canvas = None
+            self.left_window = None
+            self.right_canvas = None
+            self.right_window = None
+            
+            info("Setting up UI", prefix="INIT")
+            try:
+                self.setup_ui()
+                info("UI setup complete", prefix="INIT")
+            except Exception as e:
+                critical_error("Failed to setup UI", exception=e, prefix="INIT")
+                raise
+            
+            # Set window icon after UI is initialized (needs to be done after window is created)
+            def set_icon_safe():
+                try:
+                    self._set_window_icon()
+                except Exception as e:
+                    critical_error("Failed to set window icon", exception=e, prefix="INIT")
+            
+            def init_canvas_safe():
+                try:
+                    self.initialize_canvas_sizes()
+                except Exception as e:
+                    critical_error("Failed to initialize canvas sizes", exception=e, prefix="INIT")
+            
+            self.after(100, set_icon_safe)
+            # Initialize canvas sizes after window is displayed
+            self.after(100, init_canvas_safe)
+            
+            # Check for FFmpeg at startup (after UI is ready)
+            def check_ffmpeg_safe():
+                try:
+                    from video_processor import check_ffmpeg_available
+                    ffmpeg_path, ffprobe_path = check_ffmpeg_available()
+                    if ffmpeg_path and ffprobe_path:
+                        info("FFmpeg check passed at startup", prefix="STARTUP")
+                    else:
+                        warning("FFmpeg not available - video processing will fail", prefix="STARTUP")
+                except Exception as e:
+                    critical_error("Failed to check FFmpeg at startup", exception=e, prefix="STARTUP")
+            
+            self.after(500, check_ffmpeg_safe)  # Wait a bit for UI to be fully ready
+            
+            info("ScreenMachineApp initialization complete", prefix="INIT")
+        except Exception as e:
+            critical_error("Failed to initialize ScreenMachineApp", exception=e, prefix="INIT")
+            raise
         
     def setup_ui(self):
         """Create and layout UI components in a 2-column layout."""
         # Main container with padding
         main_frame = ctk.CTkFrame(self, fg_color="#252525")
-        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=10)
         
         # Create 2-column container
         columns_frame = ctk.CTkFrame(main_frame, fg_color="#252525")
-        columns_frame.pack(fill="both", expand=True, pady=(0, 15), padx=5)
+        columns_frame.pack(fill="both", expand=True, pady=(0, 7), padx=5)
         
         # Left column (scrollable with conditional scrollbar)
         left_column_container = ctk.CTkFrame(columns_frame, fg_color="#252525")
@@ -206,61 +255,61 @@ class ScreenMachineApp(ctk.CTk):
         # LEFT COLUMN CONTENT
         # Directory selection section (LEFT COLUMN)
         dir_frame = ctk.CTkFrame(left_column)
-        dir_frame.pack(fill="x", padx=10, pady=(10, 13))
+        dir_frame.pack(fill="x", padx=10, pady=(5, 6))
         
-        ctk.CTkLabel(dir_frame, text="Input Directory:", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=10, pady=(10, 5))
+        ctk.CTkLabel(dir_frame, text="Input Directory:", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=10, pady=(5, 2))
         input_frame = ctk.CTkFrame(dir_frame)
-        input_frame.pack(fill="x", padx=10, pady=(0, 10))
+        input_frame.pack(fill="x", padx=10, pady=(0, 5))
         ctk.CTkEntry(input_frame, textvariable=self.input_dir, state="readonly").pack(side="left", fill="x", expand=True, padx=(0, 5))
         self.input_browse_button = ctk.CTkButton(input_frame, text="Browse", command=self.browse_input_dir, width=100)
         self.input_browse_button.pack(side="right")
         
-        ctk.CTkLabel(dir_frame, text="Output Directory:", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=10, pady=(5, 5))
+        ctk.CTkLabel(dir_frame, text="Output Directory:", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=10, pady=(2, 2))
         output_frame = ctk.CTkFrame(dir_frame)
-        output_frame.pack(fill="x", padx=10, pady=(0, 5))
+        output_frame.pack(fill="x", padx=10, pady=(0, 2))
         ctk.CTkEntry(output_frame, textvariable=self.output_dir, state="readonly").pack(side="left", fill="x", expand=True, padx=(0, 5))
         self.output_browse_button = ctk.CTkButton(output_frame, text="Browse", command=self.browse_output_dir, width=100)
         self.output_browse_button.pack(side="right")
         
         # Filename suffix input
-        ctk.CTkLabel(dir_frame, text="Filename Suffix:", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=10, pady=(5, 5))
+        ctk.CTkLabel(dir_frame, text="Filename Suffix:", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=10, pady=(2, 2))
         suffix_frame = ctk.CTkFrame(dir_frame)
-        suffix_frame.pack(fill="x", padx=10, pady=(0, 5))
+        suffix_frame.pack(fill="x", padx=10, pady=(0, 2))
         self.suffix_entry = ctk.CTkEntry(suffix_frame, textvariable=self.suffix_var, placeholder_text="e.g., _thumb")
         self.suffix_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
         
         # Follow directory structure checkbox
         self.follow_structure_var = tk.BooleanVar(value=True)
         self.follow_structure_checkbox = ctk.CTkCheckBox(dir_frame, text="Follow directory structure", variable=self.follow_structure_var)
-        self.follow_structure_checkbox.pack(anchor="w", padx=10, pady=(0, 5))
+        self.follow_structure_checkbox.pack(anchor="w", padx=10, pady=(0, 2))
         
         # Overwrite existing images checkbox
         self.overwrite_var = tk.BooleanVar(value=False)
         self.overwrite_checkbox = ctk.CTkCheckBox(dir_frame, text="Overwrite existing images", variable=self.overwrite_var)
-        self.overwrite_checkbox.pack(anchor="w", padx=10, pady=(0, 10))
+        self.overwrite_checkbox.pack(anchor="w", padx=10, pady=(0, 5))
         
         # Workers setting
         workers_frame = ctk.CTkFrame(left_column)
-        workers_frame.pack(fill="x", padx=10, pady=(10, 6))
+        workers_frame.pack(fill="x", padx=10, pady=(5, 3))
         
-        ctk.CTkLabel(workers_frame, text="Number of Workers", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(8, 5))
+        ctk.CTkLabel(workers_frame, text="Number of Workers", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(4, 2))
         
         workers_inner = ctk.CTkFrame(workers_frame)
-        workers_inner.pack(pady=(0, 8), padx=2)
+        workers_inner.pack(pady=(0, 4), padx=2)
         
         ctk.CTkLabel(workers_inner, text="Workers:").grid(row=0, column=0, padx=8, pady=3, sticky="w")
         self.workers_entry = ctk.CTkEntry(workers_inner, textvariable=self.workers_var, width=80)
         self.workers_entry.grid(row=0, column=1, padx=8, pady=3)
-        ctk.CTkLabel(workers_inner, text="(2-6 for HDD, 6+ for NAS)", font=ctk.CTkFont(size=10)).grid(row=0, column=2, padx=8, pady=3, sticky="w")
+        ctk.CTkLabel(workers_inner, text="(2-6 for HDD, 6+ for NAS/SSD)", font=ctk.CTkFont(size=10)).grid(row=0, column=2, padx=8, pady=3, sticky="w")
         
         # Grid settings section (moved back to left column)
         grid_frame = ctk.CTkFrame(left_column)
-        grid_frame.pack(fill="x", padx=10, pady=(10, 6))
+        grid_frame.pack(fill="x", padx=10, pady=(5, 3))
         
-        ctk.CTkLabel(grid_frame, text="Grid Layout", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(8, 5))
+        ctk.CTkLabel(grid_frame, text="Grid Layout", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(4, 2))
         
         grid_inner = ctk.CTkFrame(grid_frame)
-        grid_inner.pack(pady=(0, 8), padx=2)
+        grid_inner.pack(pady=(0, 4), padx=2)
         
         ctk.CTkLabel(grid_inner, text="Rows:").grid(row=0, column=0, padx=8, pady=3, sticky="w")
         self.rows_var = tk.StringVar(value="5")
@@ -274,12 +323,12 @@ class ScreenMachineApp(ctk.CTk):
         
         # Screenshot size settings (moved back to left column)
         size_frame = ctk.CTkFrame(left_column)
-        size_frame.pack(fill="x", padx=10, pady=(10, 6))
+        size_frame.pack(fill="x", padx=10, pady=(5, 3))
         
-        ctk.CTkLabel(size_frame, text="Screenshot Size", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(8, 5))
+        ctk.CTkLabel(size_frame, text="Screenshot Size", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(4, 2))
         
         size_inner = ctk.CTkFrame(size_frame)
-        size_inner.pack(pady=(0, 8), padx=2)
+        size_inner.pack(pady=(0, 4), padx=2)
         
         ctk.CTkLabel(size_inner, text="Max Width:").grid(row=0, column=0, padx=8, pady=3, sticky="w")
         self.max_width_var = tk.StringVar(value="320")
@@ -293,12 +342,12 @@ class ScreenMachineApp(ctk.CTk):
         
         # Metadata labels section (moved back to left column)
         labels_frame = ctk.CTkFrame(left_column)
-        labels_frame.pack(fill="x", padx=10, pady=(10, 6))
+        labels_frame.pack(fill="x", padx=10, pady=(5, 3))
         
-        ctk.CTkLabel(labels_frame, text="Metadata Labels", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(8, 3))
+        ctk.CTkLabel(labels_frame, text="Metadata Labels", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(4, 1))
         
         label_options = ctk.CTkFrame(labels_frame)
-        label_options.pack(pady=(0, 8), padx=2)
+        label_options.pack(pady=(0, 4), padx=2)
         
         self.show_title_var = tk.BooleanVar(value=True)
         self.show_title_checkbox = ctk.CTkCheckBox(label_options, text="Title", variable=self.show_title_var)
@@ -327,13 +376,13 @@ class ScreenMachineApp(ctk.CTk):
         # RIGHT COLUMN CONTENT
         # Output format setting (at top of right column)
         format_frame = ctk.CTkFrame(right_column)
-        format_frame.pack(fill="x", padx=10, pady=(10, 6))
+        format_frame.pack(fill="x", padx=10, pady=(5, 3))
         
-        ctk.CTkLabel(format_frame, text="Output Format", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(8, 5))
+        ctk.CTkLabel(format_frame, text="Output Format", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(4, 2))
         self.output_format_var = tk.StringVar(value="JPG")
         
         format_inner = ctk.CTkFrame(format_frame)
-        format_inner.pack(pady=(0, 8), padx=2)
+        format_inner.pack(pady=(0, 4), padx=2)
         
         self.jpg_radio = ctk.CTkRadioButton(format_inner, text="JPG", variable=self.output_format_var, value="JPG",
                           command=self.on_format_change)
@@ -344,73 +393,106 @@ class ScreenMachineApp(ctk.CTk):
         
         # JPG quality setting (moved to top of right column, disabled for PNG)
         quality_frame = ctk.CTkFrame(right_column)
-        quality_frame.pack(fill="x", padx=10, pady=(10, 6))
+        quality_frame.pack(fill="x", padx=10, pady=(5, 3))
         
-        ctk.CTkLabel(quality_frame, text="JPG Quality", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(8, 3))
+        ctk.CTkLabel(quality_frame, text="JPG Quality", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(4, 1))
         self.quality_var = tk.IntVar(value=75)
         self.quality_slider = ctk.CTkSlider(quality_frame, from_=1, to=100, variable=self.quality_var, 
                                        command=lambda v: self.quality_label.configure(text=f"Quality: {int(v)}"))
-        self.quality_slider.pack(fill="x", padx=15, pady=(0, 3))
+        self.quality_slider.pack(fill="x", padx=15, pady=(0, 1))
         self.quality_label = ctk.CTkLabel(quality_frame, text="Quality: 75")
-        self.quality_label.pack(pady=(0, 8))
+        self.quality_label.pack(pady=(0, 4))
         
         # Initialize format state
         self.on_format_change()
         
         # Preview checkbox (in right column)
         preview_check_frame = ctk.CTkFrame(right_column)
-        preview_check_frame.pack(fill="x", padx=10, pady=(10, 6))
+        preview_check_frame.pack(fill="x", padx=10, pady=(5, 3))
         
         self.show_preview_var = tk.BooleanVar(value=True)
         self.show_preview_checkbox = ctk.CTkCheckBox(preview_check_frame, text="Show preview", variable=self.show_preview_var)
-        self.show_preview_checkbox.pack(pady=8)
+        self.show_preview_checkbox.pack(pady=4)
         
         # Preview window (fixed size to prevent squishing buttons)
         # Use regular Frame wrapper for proper size control
         preview_container = tk.Frame(right_column, bg="#2b2b2b")
-        preview_container.pack(fill="both", expand=True, padx=10, pady=(10, 15))
+        preview_container.pack(fill="both", expand=True, padx=10, pady=(5, 7))
         preview_container.pack_propagate(False)
         preview_container.config(width=400, height=300)
         
         preview_frame = ctk.CTkFrame(preview_container)
         preview_frame.pack(fill="both", expand=True)
         
-        ctk.CTkLabel(preview_frame, text="Screenshot Preview", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(10, 10))
+        ctk.CTkLabel(preview_frame, text="Screenshot Preview", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(5, 5))
         
         # Preview label (using regular tkinter Label for image display)
         self.preview_label = tk.Label(preview_frame, bg="#212121", text="No preview available", 
                                       fg="white", font=("Arial", 10))
-        self.preview_label.pack(fill="both", expand=True, padx=10, pady=(0, 5))
+        self.preview_label.pack(fill="both", expand=True, padx=10, pady=(0, 2))
+        
+        # Create a wrapper to log preview label updates
+        original_config = self.preview_label.config
+        
+        def logged_config(**kwargs):
+            """Wrapper that logs preview label updates, especially errors."""
+            if 'text' in kwargs:
+                text = kwargs['text']
+                if text and ('error' in text.lower() or '1 error' in text.lower()):
+                    error(f"Preview label updated with error text: {text}", prefix="PREVIEW")
+            return original_config(**kwargs)
+        
+        self.preview_label.config = logged_config
         
         # Processing time label (under preview)
         self.processing_time_label = ctk.CTkLabel(preview_frame, text="", font=ctk.CTkFont(size=11))
-        self.processing_time_label.pack(pady=(0, 10))
+        self.processing_time_label.pack(pady=(0, 5))
         
         # Progress section (right column, after preview)
         progress_frame = ctk.CTkFrame(right_column)
-        progress_frame.pack(fill="x", padx=10, pady=(10, 15))
+        progress_frame.pack(fill="x", padx=10, pady=(5, 7))
         
         self.status_label = ctk.CTkLabel(progress_frame, text="Ready", font=ctk.CTkFont(size=12))
-        self.status_label.pack(pady=(10, 5))
+        self.status_label.pack(pady=(5, 2))
+        
+        # Create a wrapper to log status label updates
+        original_status_config = self.status_label.configure
+        
+        def logged_status_config(**kwargs):
+            """Wrapper that logs status label updates, especially errors."""
+            if 'text' in kwargs:
+                text = kwargs['text']
+                if text and ('error' in text.lower() or '1 error' in text.lower() or 'errors' in text.lower()):
+                    error(f"Status label updated with error text: {text}", prefix="STATUS")
+                    critical_error(f"Status label contains error message: {text}", prefix="STATUS_LABEL")
+            return original_status_config(**kwargs)
+        
+        self.status_label.configure = logged_status_config
+        
+        # Log when status label is created
+        try:
+            info("Status label created", prefix="INIT")
+        except:
+            pass
         
         self.progress_bar = ctk.CTkProgressBar(progress_frame)
-        self.progress_bar.pack(fill="x", padx=20, pady=(0, 10))
+        self.progress_bar.pack(fill="x", padx=20, pady=(0, 5))
         self.progress_bar.set(0)
         
         # Control buttons (right column, bottom)
         button_frame = ctk.CTkFrame(right_column)
-        button_frame.pack(fill="x", padx=10, pady=(10, 10))
+        button_frame.pack(fill="x", padx=10, pady=(5, 5))
         
         self.start_button = ctk.CTkButton(button_frame, text="Start Processing", 
                                           command=self.start_processing, width=200, height=45,
                                           font=ctk.CTkFont(size=15, weight="bold"))
-        self.start_button.pack(side="left", padx=15, pady=10)
+        self.start_button.pack(side="left", padx=15, pady=5)
         
         self.stop_button = ctk.CTkButton(button_frame, text="Stop", 
                                          command=self.stop_processing, width=200, height=45,
                                          font=ctk.CTkFont(size=15, weight="bold"),
                                          state="disabled")
-        self.stop_button.pack(side="left", padx=15, pady=10)
+        self.stop_button.pack(side="left", padx=15, pady=5)
     
     def _set_window_icon(self):
         """Set window icon (called after window is initialized)."""
@@ -445,12 +527,11 @@ class ScreenMachineApp(ctk.CTk):
                             # Keep a reference to prevent garbage collection
                             self._icon_photo = icon_photo
                         except Exception as e:
-                            if not getattr(sys, 'frozen', False):
-                                print(f"Warning: Could not set window icon (method 3): {e}")
+                            # Log error but don't fail critically
+                            warning(f"Could not set window icon (method 3): {e}", prefix="Icon")
         except Exception as e:
-            # Log error for debugging (only in development)
-            if not getattr(sys, 'frozen', False):
-                print(f"Warning: Could not set window icon: {e}")
+            # Log error but don't fail critically
+            warning(f"Could not set window icon: {e}", prefix="Icon")
     
     def initialize_canvas_sizes(self):
         """Initialize canvas window sizes after the window is displayed."""
@@ -587,10 +668,18 @@ class ScreenMachineApp(ctk.CTk):
     
     def update_status(self, message: str, progress: float = None):
         """Update status label and progress bar."""
-        self.status_label.configure(text=message)
-        if progress is not None:
-            self.progress_bar.set(progress)
-        self.update_idletasks()
+        try:
+            # Log status updates that contain "error" for debugging
+            if message and ("error" in message.lower() or "1 error" in message.lower() or "errors" in message.lower()):
+                error(f"Status update (error): {message}", prefix="UI_STATUS")
+                critical_error(f"update_status called with error message: {message}", prefix="STATUS_UPDATE")
+            
+            self.status_label.configure(text=message)
+            if progress is not None:
+                self.progress_bar.set(progress)
+            self.update_idletasks()
+        except Exception as e:
+            critical_error(f"Failed to update status: {message}", exception=e, prefix="UI")
     
     def update_preview(self, grid_image):
         """Update the preview window with a completed grid image (thread-safe)."""
@@ -622,11 +711,15 @@ class ScreenMachineApp(ctk.CTk):
                     self.preview_photo = ImageTk.PhotoImage(preview_img)
                     self.preview_label.config(image=self.preview_photo, text="")
                 except Exception as e:
-                    self.preview_label.config(image="", text=f"Preview error: {str(e)}")
+                    error_msg = f"Preview error: {str(e)}"
+                    critical_error("Failed to update preview image", exception=e, prefix="PREVIEW")
+                    self.preview_label.config(image="", text=error_msg)
             
             self.after(0, update_ui)
         except Exception as e:
-            self.after(0, lambda: self.preview_label.config(image="", text=f"Preview error: {str(e)}"))
+            error_msg = f"Preview error: {str(e)}"
+            critical_error("Failed to update preview", exception=e, prefix="PREVIEW")
+            self.after(0, lambda: self.preview_label.config(image="", text=error_msg))
     
     def start_processing(self):
         """Start video processing in a separate thread."""
@@ -708,10 +801,24 @@ class ScreenMachineApp(ctk.CTk):
                 return {'status': 'skipped', 'video': video_name}
             
             # Get metadata first (necessary for aspect ratio calculation)
-            metadata = get_video_metadata(video_path)
-            if not metadata:
+            try:
+                metadata = get_video_metadata(video_path)
+                if not metadata:
+                    error(f"get_video_metadata returned None for {video_name}", prefix="VIDEO_PROCESS")
+                    return {'status': 'error', 'video': video_name, 
+                           'message': 'Could not read metadata'}
+                
+                # Add additional metadata fields needed for labels
+                metadata['filename'] = video_name
+                metadata['resolution'] = (metadata.get('width', 0), metadata.get('height', 0))
+                try:
+                    metadata['file_size'] = os.path.getsize(video_path)
+                except Exception:
+                    metadata['file_size'] = 0
+            except Exception as e:
+                critical_error(f"Exception while getting metadata for {video_name}", exception=e, prefix="VIDEO_PROCESS")
                 return {'status': 'error', 'video': video_name, 
-                       'message': 'Could not read metadata'}
+                       'message': f'Could not read metadata: {str(e)}'}
             
             # Extract screenshots
             num_screenshots = config.total_screenshots
@@ -732,8 +839,20 @@ class ScreenMachineApp(ctk.CTk):
                 return {'status': 'error', 'video': video_name,
                        'message': 'Could not extract screenshots'}
             
+            # Convert screenshots list to list of tuples (Image, timestamp) for create_grid
+            # Calculate timestamps based on video duration
+            duration = metadata.get('duration', 0.0)
+            num_screenshots = len(screenshots)
+            if duration > 0 and num_screenshots > 0:
+                # Distribute timestamps evenly across video
+                step = duration / (num_screenshots + 1)
+                screenshots_with_timestamps = [(img, step * (i + 1)) for i, img in enumerate(screenshots)]
+            else:
+                # Fallback: use 0.0 for all timestamps
+                screenshots_with_timestamps = [(img, 0.0) for img in screenshots]
+            
             # Create grid with full-res images, resize entire grid once at end
-            grid_image = create_grid(screenshots, config, metadata, resize_after_compose=True)
+            grid_image = create_grid(screenshots_with_timestamps, config, metadata, resize_after_compose=True)
             
             # Update preview with final result image (check setting at update time, not start time)
             if self.show_preview_var.get():
@@ -882,10 +1001,236 @@ class ScreenMachineApp(ctk.CTk):
             self.enable_controls()
 
 
+def setup_exception_handling():
+    """Set up global exception handling to catch unhandled exceptions."""
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        """Handle unhandled exceptions."""
+        if issubclass(exc_type, KeyboardInterrupt):
+            # Allow keyboard interrupts to propagate
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        
+        # Log critical error FIRST (before trying to show dialog)
+        critical_error(
+            f"Unhandled exception: {exc_type.__name__}",
+            exception=exc_value,
+            prefix="UNHANDLED"
+        )
+        
+        # Show error dialog if possible (when GUI is available)
+        try:
+            root = tk._default_root
+            if root:
+                try:
+                    messagebox.showerror(
+                        "Critical Error",
+                        f"An unexpected error occurred:\n\n{exc_type.__name__}: {exc_value}\n\n"
+                        f"Check the log file for details."
+                    )
+                except:
+                    pass  # If dialog fails, that's okay
+        except:
+            pass  # GUI might not be available yet
+    
+    # Set the exception hook
+    sys.excepthook = handle_exception
+    
+    # Also handle exceptions in threads (Python 3.8+)
+    if hasattr(threading, 'excepthook'):
+        def handle_thread_exception(args):
+            """Handle exceptions in threads."""
+            # args is an exception object with exc_type, exc_value, exc_traceback
+            critical_error(
+                f"Unhandled exception in thread: {args.exc_type.__name__}",
+                exception=args.exc_value,
+                prefix="THREAD"
+            )
+        
+        threading.excepthook = handle_thread_exception
+
+
+def parse_arguments():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Screen Machine - Video Screenshot Grid Generator",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument(
+        '--log',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'NONE'],
+        help='Set log level (overrides LOG_LEVEL environment variable)'
+    )
+    
+    parser.add_argument(
+        '--log-file',
+        type=str,
+        help='Path to log file (default: screenmachine.log in exe directory when running as exe)'
+    )
+    
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Enable verbose logging (equivalent to --log INFO)'
+    )
+    
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Enable debug logging (equivalent to --log DEBUG)'
+    )
+    
+    return parser.parse_args()
+
+
+def get_default_log_file():
+    """Get default log file path based on execution context."""
+    # Check if running as exe (PyInstaller)
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        # Running as exe - use exe directory
+        exe_dir = os.path.dirname(sys.executable)
+        return os.path.join(exe_dir, 'screenmachine.log')
+    else:
+        # Running from source - use script directory
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(script_dir, 'screenmachine.log')
+
+
 def main():
     """Main entry point."""
-    app = ScreenMachineApp()
-    app.mainloop()
+    try:
+        # Parse command-line arguments
+        args = parse_arguments()
+        
+        # Set log level from arguments
+        if args.debug:
+            set_log_level(LogLevel.DEBUG)
+        elif args.verbose:
+            set_log_level(LogLevel.INFO)
+        elif args.log:
+            try:
+                set_log_level(LogLevel[args.log])
+            except KeyError:
+                print(f"Invalid log level: {args.log}", file=sys.stderr)
+        
+        # Set up file logging ONLY if explicitly requested via flags
+        log_file = None
+        
+        # Only enable file logging if:
+        # 1. User explicitly specified --log-file, OR
+        # 2. User explicitly enabled logging via --log, --verbose, or --debug
+        if args.log_file:
+            # User-specified log file
+            log_file = args.log_file
+            set_log_file(log_file, always_log_errors=True)
+        elif args.debug or args.verbose or args.log:
+            # User enabled logging via flags, use default log file
+            log_file = get_default_log_file()
+            set_log_file(log_file, always_log_errors=True)
+        
+        # Log startup info (test logging to ensure it works)
+        info("=" * 60, prefix="STARTUP")
+        info("Application starting", prefix="STARTUP")
+        info(f"Python version: {sys.version}", prefix="STARTUP")
+        info(f"Running as exe: {getattr(sys, 'frozen', False)}", prefix="STARTUP")
+        info(f"Log level: {get_log_level().name}", prefix="STARTUP")
+        if log_file:
+            info(f"Log file: {log_file}", prefix="STARTUP")
+            # Test that file logging works
+            error("TEST: This is a test error message to verify file logging works", prefix="STARTUP")
+            info("TEST: This is a test info message to verify file logging works", prefix="STARTUP")
+        info("=" * 60, prefix="STARTUP")
+        
+        # Set up exception handling EARLY
+        setup_exception_handling()
+        info("Exception handling initialized", prefix="STARTUP")
+        
+        # Also catch tkinter errors that might be swallowed
+        def report_callback_exception(exc_type, exc_value, exc_traceback):
+            """Catch tkinter callback exceptions."""
+            critical_error(
+                f"Tkinter callback exception: {exc_type.__name__}",
+                exception=exc_value,
+                prefix="TKINTER_CALLBACK"
+            )
+        
+        # Hook into tkinter's exception reporting BEFORE creating the app
+        try:
+            import tkinter as tk_root
+            tk_root.report_callback_exception = report_callback_exception
+            info("Tkinter callback exception handler installed", prefix="STARTUP")
+        except Exception as e:
+            warning(f"Could not install tkinter callback handler: {e}", prefix="STARTUP")
+        
+        # Also try to catch customtkinter errors if possible
+        try:
+            import customtkinter as ctk_root
+            # CustomTkinter might have its own error handling
+            if hasattr(ctk_root, 'report_callback_exception'):
+                ctk_root.report_callback_exception = report_callback_exception
+                info("CustomTkinter callback exception handler installed", prefix="STARTUP")
+        except Exception as e:
+            warning(f"Could not install customtkinter callback handler: {e}", prefix="STARTUP")
+        
+        # Try to create and run the app
+        info("Creating application window", prefix="STARTUP")
+        app = ScreenMachineApp()
+        info("Application window created, starting mainloop", prefix="STARTUP")
+        
+        # Add a small delay to log any immediate errors after mainloop starts
+        def log_after_start():
+            try:
+                info("Mainloop started successfully, app is running", prefix="MAINLOOP")
+                # Check if there are any error indicators in the UI
+                try:
+                    status_text = app.status_label.cget("text")
+                    if status_text and "error" in status_text.lower():
+                        error(f"Status label shows error: {status_text}", prefix="UI_CHECK")
+                    
+                    # Check preview label for errors
+                    preview_text = app.preview_label.cget("text")
+                    if preview_text and ("error" in preview_text.lower() or "1 error" in preview_text.lower()):
+                        error(f"Preview label shows error: {preview_text}", prefix="UI_CHECK")
+                        critical_error(f"Preview label contains error message: {preview_text}", prefix="PREVIEW_LABEL")
+                except Exception as check_error:
+                    critical_error("Error checking UI for error messages", exception=check_error, prefix="UI_CHECK")
+            except Exception as e:
+                critical_error("Error in post-startup check", exception=e, prefix="MAINLOOP")
+        
+        app.after(500, log_after_start)  # Check after 500ms
+        app.after(1000, log_after_start)  # Check again after 1 second
+        app.after(2000, log_after_start)  # Check again after 2 seconds
+        
+        try:
+            app.mainloop()
+            info("Application mainloop ended", prefix="STARTUP")
+        except Exception as e:
+            critical_error("Error during mainloop", exception=e, prefix="MAINLOOP")
+            raise
+        
+    except KeyboardInterrupt:
+        info("Application interrupted by user", prefix="STARTUP")
+        raise
+    except Exception as e:
+        critical_error("Failed to start application", exception=e, prefix="STARTUP")
+        # Try to show error dialog if possible
+        try:
+            import tkinter.messagebox as mb
+            mb.showerror(
+                "Fatal Error",
+                f"Failed to start application:\n\n{type(e).__name__}: {str(e)}\n\n"
+                f"Check the log file for details: {log_file if 'log_file' in locals() else 'Unknown'}"
+            )
+        except:
+            pass
+        raise
+    finally:
+        # Close log file on exit
+        try:
+            info("Application shutting down", prefix="SHUTDOWN")
+        except:
+            pass
+        close_log_file()
 
 
 if __name__ == "__main__":

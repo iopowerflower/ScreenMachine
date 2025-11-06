@@ -10,6 +10,16 @@ import shutil
 
 def find_ffmpeg():
     """Find ffmpeg and ffprobe executables."""
+    # First, check for bundled binaries in project directory
+    ffmpeg_bin_dir = os.path.join(os.path.dirname(__file__), 'ffmpeg_bin')
+    bundled_ffmpeg = os.path.join(ffmpeg_bin_dir, 'ffmpeg.exe' if sys.platform == 'win32' else 'ffmpeg')
+    bundled_ffprobe = os.path.join(ffmpeg_bin_dir, 'ffprobe.exe' if sys.platform == 'win32' else 'ffprobe')
+    
+    if os.path.exists(bundled_ffmpeg) and os.path.exists(bundled_ffprobe):
+        print(f"Found bundled FFmpeg binaries in: {ffmpeg_bin_dir}")
+        return bundled_ffmpeg, bundled_ffprobe
+    
+    # Fall back to system PATH
     ffmpeg = shutil.which('ffmpeg')
     ffprobe = shutil.which('ffprobe')
     return ffmpeg, ffprobe
@@ -18,17 +28,6 @@ def find_ffmpeg():
 
 
 def build_executable():
-    """Build the executable using PyInstaller with FFmpeg bundled."""
-    print("Building executable with FFmpeg bundled...")
-    
-    # Find FFmpeg executables
-    ffmpeg_path, ffprobe_path = find_ffmpeg()
-    
-    if not ffmpeg_path or not ffprobe_path:
-        print("WARNING: FFmpeg not found in PATH. The executable will still work,")
-        print("but FFmpeg extraction will require FFmpeg to be installed separately.")
-        print("For best results, install FFmpeg and ensure it's in your PATH.")
-        print()
     
     # Determine separator for add-data (Windows uses ;, Unix uses :)
     separator = ';' if sys.platform == 'win32' else ':'
@@ -44,6 +43,8 @@ def build_executable():
         console_flag = '--noconsole'  # No console window on Linux/Mac
     
     # PyInstaller command
+    # Use --onefile for a single executable (smaller distribution)
+    # Users must have FFmpeg installed separately anyway
     cmd = [
         'pyinstaller',
         '--onefile',                    # Single executable file
@@ -51,6 +52,16 @@ def build_executable():
         f'--name={exe_name}',          # Name of the executable
         'main.py'
     ]
+    
+    # Try UPX compression if available (can reduce size by 30-50%)
+    # This is optional - if UPX isn't installed, PyInstaller will skip it
+    try:
+        import shutil
+        if shutil.which('upx'):
+            cmd.append('--upx-dir=upx')  # Use UPX if available
+            print("ℹ️  UPX compression will be used if available")
+    except:
+        pass  # UPX is optional
     
     # Add icon if it exists (try .ico for Windows, .png for Linux/Mac)
     icon_path = None
@@ -72,16 +83,8 @@ def build_executable():
         print("Icon will be included in the executable and bundled as data.")
         print()
     
-    # Add FFmpeg binaries if found
-    if ffmpeg_path and ffprobe_path:
-        cmd.extend([
-            f'--add-binary={ffmpeg_path}{separator}ffmpeg',
-            f'--add-binary={ffprobe_path}{separator}ffprobe',
-        ])
-        print(f"Found FFmpeg: {ffmpeg_path}")
-        print(f"Found ffprobe: {ffprobe_path}")
-        print("FFmpeg will be bundled with the executable.")
-        print()
+    # Don't bundle FFmpeg binaries - they're huge and users should install separately
+    # The executable will look for FFmpeg in system PATH at runtime
     
     # Additional options for better compatibility
     cmd.extend([
@@ -89,17 +92,28 @@ def build_executable():
         '--collect-all', 'av',             # Include all PyAV data
         '--hidden-import', 'PIL._tkinter_finder',  # PIL/tkinter compatibility
         '--hidden-import', 'av',            # Ensure PyAV is included
+        '--hidden-import', 'logger',       # Ensure logger module is included
+        '--hidden-import', 'config',       # Ensure config module is included
+        '--hidden-import', 'video_processor',  # Ensure video_processor is included
+        '--hidden-import', 'image_composer',    # Ensure image_composer is included
+        '--hidden-import', 'utils',        # Ensure utils module is included
+        '--hidden-import', 'ffmpeg_downloader',  # Include FFmpeg downloader
     ])
     
     try:
         subprocess.run(cmd, check=True)
         print("\nBuild complete!")
-        print(f"Executable location: dist/{exe_name}{exe_ext}")
-        print("\nNote: The executable may be quite large (~100-200MB) due to bundled dependencies.")
-        if ffmpeg_path:
-            print("FFmpeg is bundled - no separate installation required!")
-        else:
-            print("WARNING: FFmpeg was not bundled. Users will need to install FFmpeg separately.")
+        
+        dist_dir = 'dist'
+        exe_path = os.path.join(dist_dir, f"{exe_name}{exe_ext}")
+        
+        print(f"Executable location: {exe_path}")
+        
+        # Check file size
+        if os.path.exists(exe_path):
+            size_mb = os.path.getsize(exe_path) / (1024 * 1024)
+            print(f"Executable size: {size_mb:.1f} MB")
+
     except subprocess.CalledProcessError as e:
         print(f"Error building executable: {e}")
         sys.exit(1)

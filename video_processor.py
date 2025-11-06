@@ -7,6 +7,7 @@ import time
 import subprocess
 import signal
 import sys
+import threading
 
 try:
     import av
@@ -17,263 +18,404 @@ except ImportError:
 from typing import List, Tuple, Optional, Dict
 from PIL import Image
 from config import get_video_extensions
-from logger import debug, info, warning, error
+from logger import debug, info, warning, error, critical_error
 
 # Cache for file sizes to avoid redundant os.path.getsize() calls
 _file_size_cache: Dict[str, int] = {}
 
+# Lock for FFmpeg download to prevent concurrent downloads
+_ffmpeg_download_lock = threading.Lock()
+_ffmpeg_downloading = False
+
+
+def check_ffmpeg_available():
+    """
+    Check if FFmpeg and ffprobe are available, downloading if needed.
+    Returns tuple (ffmpeg_path, ffprobe_path) or (None, None) if unavailable.
+    """
+    global _ffmpeg_download_lock, _ffmpeg_downloading
+    
+    ffmpeg_path = None
+    ffprobe_path = None
+    
+    # Check if binaries exist next to executable (downloaded at runtime)
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(sys.executable)
+    else:
+        exe_dir = os.path.dirname(__file__)
+    
+    exe_dir_ffmpeg = os.path.join(exe_dir, 'ffmpeg.exe' if sys.platform == 'win32' else 'ffmpeg')
+    exe_dir_ffprobe = os.path.join(exe_dir, 'ffprobe.exe' if sys.platform == 'win32' else 'ffprobe')
+    
+    # Check local files first
+    if os.path.exists(exe_dir_ffmpeg) and os.path.exists(exe_dir_ffprobe):
+        try:
+            # Test both binaries
+            test_ffmpeg = subprocess.run(
+                [exe_dir_ffmpeg, '-version'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=2
+            )
+            test_ffprobe = subprocess.run(
+                [exe_dir_ffprobe, '-version'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=2
+            )
+            if (test_ffmpeg.returncode in (0, 1) and test_ffprobe.returncode in (0, 1)):
+                info(f"Found FFmpeg binaries next to executable", prefix="FFMPEG_CHECK")
+                return exe_dir_ffmpeg, exe_dir_ffprobe
+        except Exception as e:
+            debug(f"Cannot execute FFmpeg from exe directory: {e}", prefix="FFMPEG_CHECK")
+    
+    # Check system PATH
+    from shutil import which
+    system_ffmpeg = which('ffmpeg')
+    system_ffprobe = which('ffprobe')
+    if system_ffmpeg and system_ffprobe:
+        info(f"Found FFmpeg in system PATH", prefix="FFMPEG_CHECK")
+        return system_ffmpeg, system_ffprobe
+    
+    # Try to download if running as frozen executable on Windows
+    if getattr(sys, 'frozen', False) and sys.platform == 'win32':
+        with _ffmpeg_download_lock:
+            # Check again after acquiring lock (another thread might have downloaded)
+            if os.path.exists(exe_dir_ffmpeg) and os.path.exists(exe_dir_ffprobe):
+                info(f"FFmpeg binaries already downloaded", prefix="FFMPEG_CHECK")
+                return exe_dir_ffmpeg, exe_dir_ffprobe
+            
+            if _ffmpeg_downloading:
+                # Another thread is downloading, wait a bit and check again
+                time.sleep(2)
+                if os.path.exists(exe_dir_ffmpeg) and os.path.exists(exe_dir_ffprobe):
+                    info(f"FFmpeg binaries downloaded by another thread", prefix="FFMPEG_CHECK")
+                    return exe_dir_ffmpeg, exe_dir_ffprobe
+            
+            try:
+                _ffmpeg_downloading = True
+                info("FFmpeg not found. Attempting to download at runtime...", prefix="FFMPEG_CHECK")
+                from ffmpeg_downloader import download_ffmpeg_windows
+                
+                # Show message to user
+                try:
+                    import tkinter.messagebox as mb
+                    mb.showinfo(
+                        "Downloading FFmpeg",
+                        "FFmpeg not found. Downloading it now (this may take a minute)...\n\n"
+                        "This is a one-time download. FFmpeg will be saved next to the executable."
+                    )
+                except:
+                    pass  # GUI not available, continue anyway
+                
+                downloaded_ffmpeg, downloaded_ffprobe = download_ffmpeg_windows(exe_dir)
+                
+                if downloaded_ffmpeg and downloaded_ffprobe and \
+                   os.path.exists(downloaded_ffmpeg) and os.path.exists(downloaded_ffprobe):
+                    info(f"Successfully downloaded FFmpeg binaries", prefix="FFMPEG_CHECK")
+                    return downloaded_ffmpeg, downloaded_ffprobe
+            except ImportError:
+                error("ffmpeg_downloader module not available", prefix="FFMPEG_CHECK")
+            except Exception as e:
+                error(f"Failed to download FFmpeg: {e}", prefix="FFMPEG_CHECK")
+            finally:
+                _ffmpeg_downloading = False
+    
+    warning("FFmpeg not found. Please install FFmpeg.", prefix="FFMPEG_CHECK")
+    return None, None
+
 
 def _get_ffmpeg_path():
-    """Get FFmpeg executable path, checking bundled location first."""
-    # Check if we're in a PyInstaller bundle
-    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-        # We're in a PyInstaller bundle - check bundled location
-        bundle_dir = sys._MEIPASS
-        ffmpeg_path = os.path.join(bundle_dir, 'ffmpeg')
-        if sys.platform == 'win32':
-            ffmpeg_path += '.exe'
-        if os.path.exists(ffmpeg_path):
-            return ffmpeg_path
+    """Get FFmpeg executable path."""
+    # Cache the path to avoid redundant checks
+    if hasattr(_get_ffmpeg_path, '_cached_path'):
+        return _get_ffmpeg_path._cached_path
     
-    # Not bundled or not found - use system PATH
+    # First, check if binaries exist next to the executable (downloaded at runtime)
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(sys.executable)
+    else:
+        exe_dir = os.path.dirname(__file__)
+    
+    exe_dir_ffmpeg = os.path.join(exe_dir, 'ffmpeg.exe' if sys.platform == 'win32' else 'ffmpeg')
+    if os.path.exists(exe_dir_ffmpeg):
+        try:
+            test_result = subprocess.run(
+                [exe_dir_ffmpeg, '-version'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=2
+            )
+            if test_result.returncode == 0 or test_result.returncode == 1:
+                info(f"Found ffmpeg next to executable: {exe_dir_ffmpeg}", prefix="FFMPEG_PATH")
+                _get_ffmpeg_path._cached_path = exe_dir_ffmpeg
+                return exe_dir_ffmpeg
+        except Exception as e:
+            debug(f"Cannot execute ffmpeg from exe directory: {e}", prefix="FFMPEG_PATH")
+    
+    # Try system PATH
+    from shutil import which
+    system_ffmpeg = which('ffmpeg')
+    if system_ffmpeg:
+        info(f"Found ffmpeg in system PATH: {system_ffmpeg}", prefix="FFMPEG_PATH")
+        _get_ffmpeg_path._cached_path = system_ffmpeg
+        return system_ffmpeg
+    
+    # Final fallback - return 'ffmpeg' and let subprocess handle the error
+    warning("FFmpeg not found. Please install FFmpeg.", prefix="FFMPEG_PATH")
+    _get_ffmpeg_path._cached_path = 'ffmpeg'
     return 'ffmpeg'
 
 
 def _get_ffprobe_path():
-    """Get ffprobe executable path, checking bundled location first."""
-    # Check if we're in a PyInstaller bundle
-    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-        # We're in a PyInstaller bundle - check bundled location
-        bundle_dir = sys._MEIPASS
-        ffprobe_path = os.path.join(bundle_dir, 'ffprobe')
-        if sys.platform == 'win32':
-            ffprobe_path += '.exe'
-        if os.path.exists(ffprobe_path):
-            return ffprobe_path
+    """Get ffprobe executable path."""
+    # Cache the path to avoid redundant checks
+    if hasattr(_get_ffprobe_path, '_cached_path'):
+        return _get_ffprobe_path._cached_path
     
-    # Not bundled or not found - use system PATH
+    # First, check if binaries exist next to the executable (downloaded at runtime)
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(sys.executable)
+    else:
+        exe_dir = os.path.dirname(__file__)
+    
+    exe_dir_ffprobe = os.path.join(exe_dir, 'ffprobe.exe' if sys.platform == 'win32' else 'ffprobe')
+    if os.path.exists(exe_dir_ffprobe):
+        try:
+            test_result = subprocess.run(
+                [exe_dir_ffprobe, '-version'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=2
+            )
+            if test_result.returncode == 0 or test_result.returncode == 1:
+                info(f"Found ffprobe next to executable: {exe_dir_ffprobe}", prefix="FFPROBE_PATH")
+                _get_ffprobe_path._cached_path = exe_dir_ffprobe
+                return exe_dir_ffprobe
+        except Exception as e:
+            debug(f"Cannot execute ffprobe from exe directory: {e}", prefix="FFPROBE_PATH")
+    
+    # Try system PATH
+    from shutil import which
+    system_ffprobe = which('ffprobe')
+    if system_ffprobe:
+        info(f"Found ffprobe in system PATH: {system_ffprobe}", prefix="FFPROBE_PATH")
+        _get_ffprobe_path._cached_path = system_ffprobe
+        return system_ffprobe
+    
+    # Final fallback - return 'ffprobe' and let subprocess handle the error
+    warning("ffprobe not found. Please install FFmpeg.", prefix="FFPROBE_PATH")
+    _get_ffprobe_path._cached_path = 'ffprobe'
     return 'ffprobe'
 
 
 def find_video_files(directory: str) -> List[str]:
     """
-    Recursively find all video files in the given directory and subdirectories.
+    Find all video files in the given directory.
     
     Args:
-        directory: Root directory to search
+        directory: Path to directory to search
         
     Returns:
-        List of full paths to video files
+        List of video file paths
     """
+    if not os.path.isdir(directory):
+        return []
+    
+    video_extensions = get_video_extensions()
     video_files = []
-    extensions = get_video_extensions()
     
     for root, dirs, files in os.walk(directory):
         for file in files:
-            file_path = os.path.join(root, file)
-            _, ext = os.path.splitext(file_path.lower())
-            if ext in extensions:
-                video_files.append(file_path)
+            if any(file.lower().endswith(ext) for ext in video_extensions):
+                video_files.append(os.path.join(root, file))
     
     return sorted(video_files)
 
 
 def _kill_process(process):
-    """Kill a process and its children (cross-platform)."""
+    """Kill a subprocess and its children."""
     try:
         if sys.platform == 'win32':
-            # Windows: use taskkill to kill the process tree (suppress window)
-            subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)], 
-                         capture_output=True, timeout=2,
-                         creationflags=subprocess.CREATE_NO_WINDOW)
+            # On Windows, use taskkill to kill the process tree
+            subprocess.run(
+                ['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5
+            )
         else:
-            # Unix: use process group
+            # On Unix, kill the process group
             os.killpg(os.getpgid(process.pid), signal.SIGTERM)
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-    except Exception:
-        pass
-    finally:
-        try:
-            process.terminate()
-            process.wait(timeout=1)
-        except Exception:
-            try:
-                process.kill()
-            except Exception:
-                pass
+    except Exception as e:
+        debug(f"Error killing process: {e}", prefix="PROCESS")
 
 
 def get_metadata_ffprobe(video_path: str) -> Optional[Dict]:
     """
-    Get video metadata using ffprobe (fast, no decoding required).
-    Uses Popen with proper cleanup to ensure processes are killed.
+    Get video metadata using ffprobe.
     
     Args:
-        video_path: Path to the video file
+        video_path: Path to video file
         
     Returns:
-        Dictionary with resolution, fps, duration, or None if ffprobe fails
+        Dictionary with metadata or None if failed
     """
-    process = None
+    ffprobe_path = _get_ffprobe_path()
+    
     try:
-        # Get resolution, fps, duration, codec, and frame count in one call
-        ffprobe_path = _get_ffprobe_path()
+        # Get video metadata using ffprobe
         cmd = [
             ffprobe_path,
             '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=width,height,r_frame_rate,nb_frames,codec_name,codec_long_name',
-            '-show_entries', 'format=duration',
+            '-show_entries', 'format=duration,size,bit_rate',
+            '-show_entries', 'stream=width,height,r_frame_rate,codec_name',
             '-of', 'json',
             video_path
         ]
-        # Use Popen so we can properly kill the process if it hangs
-        # Suppress console window on Windows
-        startupinfo = None
-        creation_flags = 0
-        if sys.platform == 'win32':
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-            creation_flags = subprocess.CREATE_NO_WINDOW
         
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                                  text=True, startupinfo=startupinfo, 
-                                  creationflags=creation_flags)
-        try:
-            stdout, stderr = process.communicate(timeout=5)
-            if process.returncode == 0 and stdout.strip():
-                import json
-                data = json.loads(stdout)
-                
-                # Extract stream info
-                if 'streams' in data and len(data['streams']) > 0:
-                    stream = data['streams'][0]
-                    width = stream.get('width')
-                    height = stream.get('height')
-                    r_frame_rate = stream.get('r_frame_rate', '0/1')
-                    nb_frames = stream.get('nb_frames')
-                    codec_name = stream.get('codec_name', '').upper()
-                    codec_long_name = stream.get('codec_long_name', '')
-                    
-                    # Calculate FPS from r_frame_rate (e.g., "30000/1001" = 29.97)
-                    if r_frame_rate and '/' in r_frame_rate:
-                        num, den = map(int, r_frame_rate.split('/'))
-                        fps = num / den if den > 0 else 0
-                    else:
-                        fps = 0
-                    
-                    # Get duration from format
-                    duration = 0
-                    if 'format' in data and 'duration' in data['format']:
-                        duration = float(data['format']['duration'])
-                    elif nb_frames and fps > 0:
-                        # Calculate from frame count
-                        duration = int(nb_frames) / fps
-                    
-                    # Format codec name nicely
-                    codec = codec_name
-                    if codec_name:
-                        # Map common codec names to user-friendly format
-                        codec_map = {
-                            'H264': 'H.264',
-                            'H265': 'H.265',
-                            'HEVC': 'H.265',
-                            'AVC1': 'H.264',
-                            'MPEG4': 'MPEG-4',
-                            'MPEG2': 'MPEG-2',
-                            'VP8': 'VP8',
-                            'VP9': 'VP9',
-                            'AV1': 'AV1',
-                        }
-                        codec = codec_map.get(codec_name, codec_name)
-                    
-                    if width and height:
-                        return {
-                            'resolution': (int(width), int(height)),
-                            'fps': fps,
-                            'duration': duration,
-                            'codec': codec,
-                            'nb_frames': int(nb_frames) if nb_frames else None
-                        }
-        except subprocess.TimeoutExpired:
-            # Process is hanging - kill it
-            warning(f"Timeout getting metadata for {os.path.basename(video_path)}, killing process", "ffprobe")
-            _kill_process(process)
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            error(f"ffprobe failed for {os.path.basename(video_path)}: {result.stderr}", prefix="FFPROBE")
             return None
-    except (FileNotFoundError, ValueError, Exception) as e:
-        # ffprobe not available or failed
-        if process:
-            _kill_process(process)
-    finally:
-        if process and process.poll() is None:
-            _kill_process(process)
-    return None
+        
+        import json
+        data = json.loads(result.stdout)
+        
+        # Extract metadata
+        format_info = data.get('format', {})
+        streams = data.get('streams', [])
+        
+        # Find video stream
+        video_stream = None
+        for stream in streams:
+            if stream.get('codec_type') == 'video':
+                video_stream = stream
+                break
+        
+        if not video_stream:
+            error(f"No video stream found in {os.path.basename(video_path)}", prefix="FFPROBE")
+            return None
+        
+        # Parse duration
+        duration_str = format_info.get('duration', '0')
+        try:
+            duration = float(duration_str)
+        except (ValueError, TypeError):
+            duration = 0.0
+        
+        # Parse frame rate
+        fps_str = video_stream.get('r_frame_rate', '0/1')
+        try:
+            num, den = map(int, fps_str.split('/'))
+            fps = num / den if den > 0 else 0.0
+        except (ValueError, ZeroDivisionError):
+            fps = 0.0
+        
+        # Get resolution
+        width = video_stream.get('width', 0)
+        height = video_stream.get('height', 0)
+        
+        metadata = {
+            'duration': duration,
+            'fps': fps,
+            'width': width,
+            'height': height,
+            'codec': video_stream.get('codec_name', 'unknown')
+        }
+        
+        return metadata
+        
+    except FileNotFoundError:
+        error(f"ffprobe not found. Please install FFmpeg.", prefix="FFPROBE")
+        return None
+    except subprocess.TimeoutExpired:
+        error(f"ffprobe timed out for {os.path.basename(video_path)}", prefix="FFPROBE")
+        return None
+    except Exception as e:
+        error(f"Exception in get_metadata_ffprobe for {os.path.basename(video_path)}: {e}", prefix="FFPROBE")
+        return None
 
 
 def get_video_metadata(video_path: str, file_size: int = None) -> Optional[Dict]:
     """
-    Extract metadata from a video file using ffprobe.
+    Get video metadata from file.
     
     Args:
-        video_path: Path to the video file
-        file_size: Optional file size in bytes (if already known, avoids os.path.getsize call)
+        video_path: Path to video file
+        file_size: Optional file size (to avoid redundant os.path.getsize calls)
         
     Returns:
-        Dictionary containing metadata:
-        - resolution: (width, height) tuple
-        - duration: Duration in seconds
-        - fps: Frames per second
-        - codec: Codec string (if available from ffprobe)
-        - file_size: File size in bytes
-        - filename: Just the filename without path
+        Dictionary with metadata or None if failed
     """
-    global _file_size_cache
-    
-    # Get metadata using ffprobe (fast, no decoding required)
-    ffprobe_metadata = get_metadata_ffprobe(video_path)
-    
-    if ffprobe_metadata:
-        width, height = ffprobe_metadata['resolution']
-        fps = ffprobe_metadata['fps']
-        duration = ffprobe_metadata['duration']
-        codec = ffprobe_metadata.get('codec', 'Unknown')
+    try:
+        # Try PyAV first (faster, no subprocess)
+        if PYAV_AVAILABLE:
+            try:
+                import av
+                container = av.open(video_path)
+                
+                # Get video stream
+                video_stream = None
+                for stream in container.streams.video:
+                    video_stream = stream
+                    break
+                
+                if not video_stream:
+                    debug(f"No video stream found in {video_path}", prefix="METADATA")
+                    container.close()
+                    return None
+                
+                # Get duration
+                duration = float(container.duration) / av.time_base if container.duration else 0.0
+                
+                # Get FPS
+                fps = float(video_stream.average_rate) if video_stream.average_rate else 0.0
+                
+                # Get resolution
+                width = video_stream.width
+                height = video_stream.height
+                
+                # Get codec
+                codec = video_stream.codec.name if video_stream.codec else 'unknown'
+                
+                container.close()
+                
+                metadata = {
+                    'duration': duration,
+                    'fps': fps,
+                    'width': width,
+                    'height': height,
+                    'codec': codec
+                }
+                
+                return metadata
+                
+            except Exception as e:
+                debug(f"PyAV failed for {os.path.basename(video_path)}, trying ffprobe: {e}", prefix="METADATA")
         
-        # Get other metadata (file size, filename)
-        # Use provided file_size if available, otherwise check cache, then fetch
-        if file_size is None:
-            # Check cache first
-            if video_path in _file_size_cache:
-                file_size = _file_size_cache[video_path]
-            else:
-                # Fetch file size and cache it
-                file_size = os.path.getsize(video_path)
-                _file_size_cache[video_path] = file_size  # Cache for future use
-        else:
-            # File size was provided, cache it for future use
-            _file_size_cache[video_path] = file_size
+        # Fallback to ffprobe
+        return get_metadata_ffprobe(video_path)
         
-        filename = os.path.basename(video_path)
-        
-        return {
-            'resolution': (width, height),
-            'duration': duration,
-            'fps': fps,
-            'codec': codec,
-            'file_size': file_size,
-            'filename': filename
-        }
-    
-    # ffprobe failed - return None (no fallback)
-    return None
+    except Exception as e:
+        error(f"get_video_metadata failed for {os.path.basename(video_path)}: {e}", prefix="VIDEO_METADATA")
+        return None
 
 
 def resize_image(image: Image.Image, max_width: int, max_height: int) -> Image.Image:
     """
-    Resize an image maintaining aspect ratio, fitting within max dimensions.
+    Resize an image maintaining aspect ratio.
     
     Args:
         image: PIL Image to resize
@@ -283,440 +425,232 @@ def resize_image(image: Image.Image, max_width: int, max_height: int) -> Image.I
     Returns:
         Resized PIL Image
     """
-    original_width, original_height = image.size
+    if not image:
+        return image
     
-    # Calculate scaling factor to fit within max dimensions
-    width_ratio = max_width / original_width
-    height_ratio = max_height / original_height
-    ratio = min(width_ratio, height_ratio)
+    width, height = image.size
     
-    # Only resize if image is larger than max dimensions
-    if ratio < 1.0:
-        new_width = int(original_width * ratio)
-        new_height = int(original_height * ratio)
-        image = image.resize((new_width, new_height), Image.Resampling.NEAREST)
+    # Calculate new size maintaining aspect ratio
+    if width <= max_width and height <= max_height:
+        return image
     
-    return image
+    ratio = min(max_width / width, max_height / height)
+    new_width = int(width * ratio)
+    new_height = int(height * ratio)
+    
+    return image.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
 
 def extract_screenshots_pyav(video_path: str, num_screenshots: int,
-                             max_width: int = None, max_height: int = None,
-                             preview_callback=None,
-                             full_resolution: bool = False,
-                             original_resolution: tuple = None,
-                             duration: float = None, fps: float = None) -> List[Tuple[Image.Image, float]]:
+                             max_width: int, max_height: int,
+                             preview_callback=None, full_resolution: bool = False,
+                             original_resolution: bool = False,
+                             duration: float = None, fps: float = None) -> Optional[List[Image.Image]]:
     """
     Internal function: Extract screenshots using PyAV (FFmpeg Python bindings).
-    Called by extract_screenshots() - see that function for full parameter documentation.
+    
+    Args:
+        video_path: Path to video file
+        num_screenshots: Number of screenshots to extract
+        max_width: Maximum width for screenshots
+        max_height: Maximum height for screenshots
+        preview_callback: Optional callback function(path, frame_index, total) for preview updates
+        full_resolution: If True, extract at full resolution (ignores max_width/max_height)
+        original_resolution: If True, keep original resolution (ignores max_width/max_height)
+        duration: Video duration in seconds (optional, for better frame selection)
+        fps: Video FPS (optional, for better frame selection)
+        
+    Returns:
+        List of PIL Images or None if failed
     """
     if not PYAV_AVAILABLE:
-        raise ImportError("PyAV not available. Install with: pip install av")
+        return None
     
-    # Get metadata if not provided
-    if duration is None or fps is None:
-        metadata = get_metadata_ffprobe(video_path)
-        if metadata:
-            duration = metadata.get('duration', 0)
-            fps = metadata.get('fps', 0)
-            if not original_resolution:
-                original_resolution = metadata.get('resolution')
-        else:
-            metadata = get_video_metadata(video_path)
-            if metadata:
-                duration = metadata.get('duration', 0)
-                fps = metadata.get('fps', 0)
-                if not original_resolution:
-                    original_resolution = metadata.get('resolution')
-    
-    if duration == 0 or num_screenshots == 0:
-        return []
-    
-    # Calculate target timestamps (evenly distributed)
-    if num_screenshots == 1:
-        timestamps = [duration / 2]
-    else:
-        interval = duration / (num_screenshots + 1)
-        timestamps = [interval * (i + 1) for i in range(num_screenshots)]
-    
-    # Calculate decode resolution if needed
-    decode_width = None
-    decode_height = None
-    
-    if max_width and max_height and original_resolution and not full_resolution:
-        orig_w, orig_h = original_resolution
-        orig_aspect = orig_w / orig_h if orig_h > 0 else 1.0
-        
-        target_w = max_width
-        target_h = max_height
-        
-        if orig_aspect > (target_w / target_h):
-            decode_width = target_w
-            decode_height = int(target_w / orig_aspect)
-        else:
-            decode_height = target_h
-            decode_width = int(target_h * orig_aspect)
-    
-    screenshots = []
-    
-    # OPTIMIZATION: Don't pre-scan for keyframes - it requires reading the entire file!
-    # PyAV can seek efficiently on its own - it automatically finds the nearest keyframe.
-    # Sort timestamps to minimize disk head movement on spinning disks
-    timestamps_sorted = sorted(timestamps)
-    
-    # OPTIMIZATION: Open container once and reuse for all frames (much faster on spinning disks)
-    # Opening/closing for each frame causes re-reading of headers/index on spinning disks
-    container = None
-    video_stream = None
     try:
-        try:
-            container = av.open(video_path)
-            if not container or len(container.streams.video) == 0:
-                error(f"No video stream found in {os.path.basename(video_path)}", "PyAV")
-                return []
-            video_stream = container.streams.video[0]
-        except Exception as e:
-            error(f"Failed to open {os.path.basename(video_path)}: {str(e)}", "PyAV")
-            return []
+        import av
         
-        # Extract frames at each timestamp - PyAV will automatically find the nearest keyframe
-        frames_found = 0
-        frames_skipped = 0
-        if len(timestamps_sorted) == 0:
-            warning(f"No timestamps to extract for {os.path.basename(video_path)}", "PyAV")
-            return []
+        container = av.open(video_path)
+        video_stream = None
         
-        for i, timestamp in enumerate(timestamps_sorted):
-            try:
-                # Seek directly to timestamp - PyAV automatically finds nearest keyframe
-                # Use any_frame=False to seek to keyframes (more efficient)
-                try:
-                    container.seek(int(timestamp * 1000000), any_frame=False)
-                except Exception as seek_err:
-                    if i < 3:  # Log first few seek errors
-                        debug(f"Seek failed @ {timestamp:.2f}s: {str(seek_err)}", "PyAV")
-                    frames_skipped += 1
-                    continue
-                
-                # Decode frames - only need the first frame after seek
-                best_frame = None
-                frames_decoded = 0
-                max_decode_time = 1.0  # Maximum time to spend decoding (1 second)
-                decode_deadline = time.time() + max_decode_time
-                
-                try:
-                    for frame in container.decode(video_stream):
-                        if time.time() > decode_deadline:
-                            if i < 3:  # Log first few timeouts
-                                debug(f"Decode timeout @ {timestamp:.2f}s after {frames_decoded} frames", "PyAV")
-                            break
-                        frames_decoded += 1
-                        best_frame = frame  # Take the first frame after seek
-                        # Stop immediately after first frame - we don't need more
-                        break
-                except Exception as decode_err:
-                    if i < 3:  # Log first few decode errors
-                        debug(f"Decode error @ {timestamp:.2f}s: {str(decode_err)}", "PyAV")
-                
-                if best_frame is None:
-                    frames_skipped += 1
-                    if i < 3:  # Log first few failures
-                        debug(f"No frame found @ {timestamp:.2f}s after seek, decoded {frames_decoded} frames", "PyAV")
-                    continue
-                
-                frames_found += 1
-                
-                # Convert frame to PIL Image
-                frame_array = best_frame.to_ndarray(format='rgb24')
-                pil_image = Image.fromarray(frame_array)
-                
-                # Resize if needed
-                if not full_resolution and max_width and max_height:
-                    if original_resolution:
-                        orig_w, orig_h = original_resolution
-                        orig_aspect = orig_w / orig_h if orig_h > 0 else 1.0
-                        
-                        if orig_aspect > (max_width / max_height):
-                            final_width = max_width
-                            final_height = int(max_width / orig_aspect)
-                        else:
-                            final_height = max_height
-                            final_width = int(max_height * orig_aspect)
-                        
-                        if pil_image.size != (final_width, final_height):
-                            pil_image = pil_image.resize((final_width, final_height), Image.Resampling.NEAREST)
-                    else:
-                        pil_image = resize_image(pil_image, max_width, max_height)
-                
-                # Store with original timestamp
-                screenshots.append((pil_image, timestamp))
-                    
-            except Exception as e:
-                # Skip this frame if extraction fails
-                frames_skipped += 1
-                if i < 3:  # Log first few exceptions
-                    debug(f"Exception extracting frame @ {timestamp:.2f}s: {str(e)}", "PyAV")
-                continue
-    finally:
-        # Close container once after all frames are extracted
-        if container:
-            try:
-                container.close()
-            except:
-                pass
-    
-    # Create mapping from timestamp to screenshots (screenshots already have original timestamps)
-    timestamp_to_screenshot = {screenshot[1]: screenshot[0] for screenshot in screenshots}
-    
-    # Build final screenshots list using original timestamps (preserve order)
-    final_screenshots = []
-    for original_timestamp in timestamps:
-        pil_image = timestamp_to_screenshot.get(original_timestamp)
+        for stream in container.streams.video:
+            video_stream = stream
+            break
         
-        if pil_image:
-            final_screenshots.append((pil_image, original_timestamp))
+        if not video_stream:
+            container.close()
+            return None
+        
+        # Get actual duration and FPS if not provided
+        if duration is None:
+            duration = float(container.duration) / av.time_base if container.duration else 0.0
+        if fps is None:
+            fps = float(video_stream.average_rate) if video_stream.average_rate else 0.0
+        
+        # Calculate timestamps for screenshots
+        if duration > 0 and num_screenshots > 0:
+            # Distribute screenshots evenly across the video
+            step = duration / (num_screenshots + 1)
+            timestamps = [step * (i + 1) for i in range(num_screenshots)]
+        else:
+            # Fallback: extract from beginning
+            timestamps = [0.0] * num_screenshots
+        
+        screenshots = []
+        frames_seen = 0
+        
+        for timestamp in timestamps:
+            # Seek to timestamp
+            container.seek(int(timestamp * av.time_base))
             
-            if preview_callback:
-                preview_callback(pil_image, original_timestamp)
-    
-    # Log summary if we got fewer frames than expected
-    if len(final_screenshots) < num_screenshots:
-        warning(f"Only extracted {len(final_screenshots)}/{num_screenshots} frames for {os.path.basename(video_path)} "
-                f"(found: {frames_found}, skipped: {frames_skipped})", "PyAV")
-    
-    return final_screenshots
+            # Extract frame
+            for frame in container.decode(video_stream):
+                if frame.time >= timestamp or frames_seen == 0:
+                    # Convert to PIL Image
+                    img = frame.to_image()
+                    
+                    # Resize if needed
+                    if not full_resolution and not original_resolution:
+                        img = resize_image(img, max_width, max_height)
+                    
+                    screenshots.append(img)
+                    
+                    # Call preview callback if provided
+                    if preview_callback:
+                        try:
+                            preview_callback(video_path, len(screenshots), num_screenshots)
+                        except:
+                            pass
+                    
+                    break
+                frames_seen += 1
+        
+        container.close()
+        return screenshots if screenshots else None
+        
+    except Exception as e:
+        error(f"PyAV extraction failed for {os.path.basename(video_path)}: {e}", prefix="PYAV")
+        return None
 
 
 def extract_screenshots_ffmpeg(video_path: str, num_screenshots: int,
-                                max_width: int = None, max_height: int = None,
-                                preview_callback=None,
-                                full_resolution: bool = False,
-                                original_resolution: tuple = None,
-                                duration: float = None, fps: float = None) -> List[Tuple[Image.Image, float]]:
+                               max_width: int, max_height: int,
+                               preview_callback=None, full_resolution: bool = False,
+                               original_resolution: bool = False,
+                               duration: float = None, fps: float = None) -> Optional[List[Image.Image]]:
     """
     Internal function: Extract screenshots using ffmpeg subprocess.
-    Called by extract_screenshots() - see that function for full parameter documentation.
-    """
-    # Get metadata if not provided
-    if duration is None or fps is None:
-        metadata = get_metadata_ffprobe(video_path)
-        if metadata:
-            duration = metadata.get('duration', 0)
-            fps = metadata.get('fps', 0)
-            if not original_resolution:
-                original_resolution = metadata.get('resolution')
-        else:
-            # Fallback: try to get from get_video_metadata (uses ffprobe)
-            metadata = get_video_metadata(video_path)
-            if metadata:
-                duration = metadata.get('duration', 0)
-                fps = metadata.get('fps', 0)
-                if not original_resolution:
-                    original_resolution = metadata.get('resolution')
-    
-    if duration == 0 or num_screenshots == 0:
-        return []
-    
-    # Calculate target timestamps (evenly distributed)
-    if num_screenshots == 1:
-        timestamps = [duration / 2]
-    else:
-        interval = duration / (num_screenshots + 1)
-        timestamps = [interval * (i + 1) for i in range(num_screenshots)]
-    
-    # Calculate decode resolution if needed
-    decode_width = None
-    decode_height = None
-    scale_filter = None
-    
-    if max_width and max_height and original_resolution and not full_resolution:
-        orig_w, orig_h = original_resolution
-        orig_aspect = orig_w / orig_h if orig_h > 0 else 1.0
-        
-        target_w = max_width
-        target_h = max_height
-        
-        # Calculate dimensions that fit within target while maintaining aspect ratio
-        if orig_aspect > (target_w / target_h):
-            decode_width = target_w
-            decode_height = int(target_w / orig_aspect)
-        else:
-            decode_height = target_h
-            decode_width = int(target_h * orig_aspect)
-        
-        scale_filter = f"scale={decode_width}:{decode_height}"
-    
-    screenshots = []
-    
-    # OPTIMIZATION: Sort timestamps to minimize disk head movement on spinning disks
-    # This significantly improves performance when reading from spinning disks
-    timestamps_sorted = sorted(timestamps)
-    
-    # Extract frames one at a time using -ss seeking (network-efficient, seeks directly to timestamps)
-    for timestamp in timestamps_sorted:
-        try:
-            # Build ffmpeg command
-            # -ss before -i enables input seeking (much faster, reads less data!)
-            ffmpeg_path = _get_ffmpeg_path()
-            cmd = [ffmpeg_path, '-v', 'error', '-ss', str(timestamp), '-i', video_path]
-            
-            # Add scale filter if decoding at lower resolution
-            if scale_filter:
-                cmd.extend(['-vf', scale_filter])
-            
-            # Output single frame as PNG to stdout
-            cmd.extend(['-vframes', '1', '-f', 'image2pipe', '-vcodec', 'png', '-'])
-            
-            # Run ffmpeg with proper cleanup
-            # Suppress console window on Windows
-            startupinfo = None
-            creation_flags = 0
-            if sys.platform == 'win32':
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                startupinfo.wShowWindow = subprocess.SW_HIDE
-                creation_flags = subprocess.CREATE_NO_WINDOW
-            
-            process = None
-            stdout = None
-            try:
-                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                          startupinfo=startupinfo, creationflags=creation_flags)
-                # Use longer timeout for large videos (30 seconds should be enough for most)
-                stdout, stderr = process.communicate(timeout=30)
-                
-                # Always ensure process is terminated, even after successful completion
-                if process.poll() is None:
-                    # Process still running somehow - kill it
-                    _kill_process(process)
-                
-                if process.returncode != 0:
-                    continue
-            except subprocess.TimeoutExpired:
-                warning(f"Timeout extracting frame @ {timestamp:.2f}s for {os.path.basename(video_path)}, killing process", "FFmpeg")
-                if process:
-                    _kill_process(process)
-                continue
-            except Exception as e:
-                # Ensure process is killed on any exception
-                if process:
-                    _kill_process(process)
-                continue
-            finally:
-                # Double-check: ensure process is always terminated
-                if process:
-                    try:
-                        if process.poll() is None:
-                            # Process still running - kill it aggressively
-                            _kill_process(process)
-                        # Ensure process handle is closed
-                        process.wait(timeout=0.1)
-                    except:
-                        # If wait fails, process is already dead - that's fine
-                        pass
-            
-            if stdout is None:
-                continue
-            
-            # Load image from stdout
-            from io import BytesIO
-            image_data = BytesIO(stdout)
-            pil_image = Image.open(image_data)
-            
-            # Convert to RGB if needed (video frames are typically RGB, but handle other modes)
-            if pil_image.mode != 'RGB':
-                pil_image = pil_image.convert('RGB')
-            
-            # Resize if needed (if we decoded at lower resolution, we may need to resize to exact target)
-            if not full_resolution and max_width and max_height:
-                if original_resolution:
-                    orig_w, orig_h = original_resolution
-                    orig_aspect = orig_w / orig_h if orig_h > 0 else 1.0
-                    
-                    # Calculate final dimensions maintaining aspect ratio
-                    if orig_aspect > (max_width / max_height):
-                        final_width = max_width
-                        final_height = int(max_width / orig_aspect)
-                    else:
-                        final_height = max_height
-                        final_width = int(max_height * orig_aspect)
-                    
-                    # Resize if different from decode size
-                    if pil_image.size != (final_width, final_height):
-                        pil_image = pil_image.resize((final_width, final_height), Image.Resampling.NEAREST)
-                else:
-                    # Standard resize
-                    pil_image = resize_image(pil_image, max_width, max_height)
-            
-            screenshots.append((pil_image, timestamp))
-                
-        except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
-            # Skip this frame if extraction fails
-            continue
-    
-    # Create mapping from timestamp to screenshots (we extracted in sorted order)
-    timestamp_to_screenshot = {screenshot[1]: screenshot[0] for screenshot in screenshots}
-    
-    # Build final screenshots list using original timestamps (preserve order)
-    final_screenshots = []
-    for original_timestamp in timestamps:
-        pil_image = timestamp_to_screenshot.get(original_timestamp)
-        
-        if pil_image:
-            final_screenshots.append((pil_image, original_timestamp))
-            
-            # Call preview callback if provided
-            if preview_callback:
-                preview_callback(pil_image, original_timestamp)
-    
-    return final_screenshots
-
-
-def extract_screenshots(video_path: str, num_screenshots: int, 
-                       max_width: int = None, max_height: int = None,
-                       preview_callback=None,
-                       full_resolution: bool = False,
-                       original_resolution: tuple = None,
-                       duration: float = None,
-                       fps: float = None) -> List[Tuple[Image.Image, float]]:
-    """
-    Extract screenshots from a video at evenly spaced intervals.
-    
-    Uses PyAV (FFmpeg bindings) or FFmpeg subprocess for efficient video decoding.
-    PyAV is preferred for better performance (no subprocess overhead).
-    Falls back to FFmpeg subprocess if PyAV is not available or fails.
     
     Args:
-        video_path: Path to the video file
+        video_path: Path to video file
         num_screenshots: Number of screenshots to extract
-        max_width: Maximum width for each screenshot (ignored if full_resolution=True)
-        max_height: Maximum height for each screenshot (ignored if full_resolution=True)
-        preview_callback: Optional callback function(image, timestamp) called for each screenshot
-        full_resolution: If True, return full-resolution frames without resizing
-        original_resolution: Original video resolution tuple (width, height) for aspect ratio preservation
-        duration: Video duration in seconds (if known, avoids extra ffprobe call)
-        fps: Video FPS (if known, avoids extra ffprobe call)
+        max_width: Maximum width for screenshots
+        max_height: Maximum height for screenshots
+        preview_callback: Optional callback function(path, frame_index, total) for preview updates
+        full_resolution: If True, extract at full resolution (ignores max_width/max_height)
+        original_resolution: If True, keep original resolution (ignores max_width/max_height)
+        duration: Video duration in seconds (optional, for better frame selection)
+        fps: Video FPS (optional, for better frame selection)
         
     Returns:
-        List of tuples (PIL Image, timestamp in seconds)
+        List of PIL Images or None if failed
     """
-    # Get metadata if not provided (avoid redundant calls)
-    if duration is None or fps is None or not original_resolution:
-        metadata = get_metadata_ffprobe(video_path)
-        if not metadata:
-            # If we need to call get_video_metadata, check cache for file_size first
-            # This avoids redundant os.path.getsize() calls
-            cached_file_size = _file_size_cache.get(video_path)
-            metadata = get_video_metadata(video_path, file_size=cached_file_size)
+    ffmpeg_path = _get_ffmpeg_path()
+    
+    try:
+        # Calculate timestamps for screenshots
+        if duration and duration > 0 and num_screenshots > 0:
+            # Distribute screenshots evenly across the video
+            step = duration / (num_screenshots + 1)
+            timestamps = [step * (i + 1) for i in range(num_screenshots)]
+        else:
+            # Fallback: extract from beginning
+            timestamps = [0.0] * num_screenshots
         
-        if not metadata:
-            raise ValueError(f"Could not read metadata from video file: {video_path}")
+        screenshots = []
         
-        if duration is None:
-            duration = metadata.get('duration', 0)
-        if fps is None:
-            fps = metadata.get('fps', 0)
-        if not original_resolution:
-            original_resolution = metadata.get('resolution')
+        for i, timestamp in enumerate(timestamps):
+            try:
+                # Build ffmpeg command
+                cmd = [
+                    ffmpeg_path,
+                    '-ss', str(timestamp),
+                    '-i', video_path,
+                    '-vframes', '1',
+                    '-f', 'image2pipe',
+                    '-vcodec', 'png',
+                    '-'
+                ]
+                
+                # Add scaling if needed
+                if not full_resolution and not original_resolution:
+                    cmd.insert(-1, '-vf')
+                    cmd.insert(-1, f'scale={max_width}:{max_height}:force_original_aspect_ratio=decrease')
+                
+                # Run ffmpeg
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=30
+                )
+                
+                if result.returncode != 0:
+                    warning(f"ffmpeg failed for frame {i+1} at {timestamp:.2f}s: {result.stderr.decode('utf-8', errors='ignore')[:200]}", prefix="FFmpeg")
+                    continue
+                
+                # Load image from bytes
+                from io import BytesIO
+                img = Image.open(BytesIO(result.stdout))
+                screenshots.append(img)
+                
+                # Call preview callback if provided
+                if preview_callback:
+                    try:
+                        preview_callback(video_path, len(screenshots), num_screenshots)
+                    except:
+                        pass
+                
+            except subprocess.TimeoutExpired:
+                warning(f"Timeout extracting frame @ {timestamp:.2f}s for {os.path.basename(video_path)}, killing process", prefix="FFmpeg")
+                # Skip this frame if extraction fails
+                continue
+            except Exception as e:
+                warning(f"Error extracting frame @ {timestamp:.2f}s for {os.path.basename(video_path)}: {e}", prefix="FFmpeg")
+                # Skip this frame if extraction fails
+                continue
+        
+        return screenshots if screenshots else None
+        
+    except FileNotFoundError:
+        error(f"ffmpeg not found. Please install FFmpeg.", prefix="FFmpeg")
+        return None
+    except Exception as e:
+        error(f"Exception in extract_screenshots_ffmpeg for {os.path.basename(video_path)}: {e}", prefix="FFmpeg")
+        return None
+
+
+def extract_screenshots(video_path: str, num_screenshots: int,
+                       max_width: int, max_height: int,
+                       preview_callback=None, full_resolution: bool = False,
+                       original_resolution: bool = False,
+                       duration: float = None, fps: float = None) -> Optional[List[Image.Image]]:
+    """
+    Extract screenshots from a video file.
+    
+    Args:
+        video_path: Path to video file
+        num_screenshots: Number of screenshots to extract
+        max_width: Maximum width for screenshots
+        max_height: Maximum height for screenshots
+        preview_callback: Optional callback function(path, frame_index, total) for preview updates
+        full_resolution: If True, extract at full resolution (ignores max_width/max_height)
+        original_resolution: If True, keep original resolution (ignores max_width/max_height)
+        duration: Video duration in seconds (optional, for better frame selection)
+        fps: Video FPS (optional, for better frame selection)
+        
+    Returns:
+        List of PIL Images or None if failed
+    """
     
     # Try PyAV first (best performance - network-efficient + no subprocess overhead)
     if PYAV_AVAILABLE:
@@ -728,25 +662,12 @@ def extract_screenshots(video_path: str, num_screenshots: int,
             )
             if result and len(result) > 0:
                 return result
-            else:
-                # PyAV returned empty result - log it
-                info(f"Returned empty result for {os.path.basename(video_path)}, falling back to FFmpeg subprocess", "PyAV")
         except Exception as e:
-            # Log why PyAV failed (helps debug why FFmpeg subprocess is being used)
-            info(f"Failed for {os.path.basename(video_path)}, falling back to FFmpeg subprocess: {str(e)}", "PyAV")
-            # Fall through to FFmpeg subprocess if PyAV fails
-            pass
+            debug(f"PyAV extraction failed, falling back to ffmpeg: {e}", prefix="EXTRACT")
     
-    # Fallback to FFmpeg subprocess if PyAV not available or failed
-    result = extract_screenshots_ffmpeg(
+    # Fallback to ffmpeg subprocess
+    return extract_screenshots_ffmpeg(
         video_path, num_screenshots, max_width, max_height,
         preview_callback, full_resolution,
         original_resolution, duration, fps
     )
-    
-    if result:
-        return result
-    
-    # Both PyAV and FFmpeg failed - raise error
-    raise ValueError(f"Could not extract screenshots from video file: {video_path}")
-
