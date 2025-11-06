@@ -9,6 +9,12 @@ import signal
 import sys
 import threading
 
+# Windows-specific subprocess flag to suppress console windows
+if sys.platform == 'win32':
+    CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW
+else:
+    CREATE_NO_WINDOW = 0
+
 try:
     import av
     PYAV_AVAILABLE = True
@@ -55,13 +61,15 @@ def check_ffmpeg_available():
                 [exe_dir_ffmpeg, '-version'],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=2
+                timeout=2,
+                creationflags=CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             )
             test_ffprobe = subprocess.run(
                 [exe_dir_ffprobe, '-version'],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=2
+                timeout=2,
+                creationflags=CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             )
             if (test_ffmpeg.returncode in (0, 1) and test_ffprobe.returncode in (0, 1)):
                 info(f"Found FFmpeg binaries next to executable", prefix="FFMPEG_CHECK")
@@ -144,7 +152,8 @@ def _get_ffmpeg_path():
                 [exe_dir_ffmpeg, '-version'],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=2
+                timeout=2,
+                creationflags=CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             )
             if test_result.returncode == 0 or test_result.returncode == 1:
                 info(f"Found ffmpeg next to executable: {exe_dir_ffmpeg}", prefix="FFMPEG_PATH")
@@ -186,7 +195,8 @@ def _get_ffprobe_path():
                 [exe_dir_ffprobe, '-version'],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=2
+                timeout=2,
+                creationflags=CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             )
             if test_result.returncode == 0 or test_result.returncode == 1:
                 info(f"Found ffprobe next to executable: {exe_dir_ffprobe}", prefix="FFPROBE_PATH")
@@ -242,7 +252,8 @@ def _kill_process(process):
                 ['taskkill', '/F', '/T', '/PID', str(process.pid)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=5
+                timeout=5,
+                creationflags=CREATE_NO_WINDOW
             )
         else:
             # On Unix, kill the process group
@@ -283,7 +294,8 @@ def get_metadata_ffprobe(video_path: str) -> Optional[Dict]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=10,
-            text=True
+            text=True,
+            creationflags=CREATE_NO_WINDOW if sys.platform == 'win32' else 0
         )
         
         if result.returncode != 0:
@@ -591,7 +603,8 @@ def extract_screenshots_ffmpeg(video_path: str, num_screenshots: int,
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    timeout=30
+                    timeout=30,
+                    creationflags=CREATE_NO_WINDOW if sys.platform == 'win32' else 0
                 )
                 
                 if result.returncode != 0:
